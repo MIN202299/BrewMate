@@ -34,7 +34,21 @@ Zero third-party dependencies — built entirely with Apple frameworks (SwiftUI,
 - **Homebrew** installed (at `/opt/homebrew/bin/brew` or `/usr/local/bin/brew`)
 - **Swift 5.9+** (from Xcode or Command Line Tools)
 
-## Quick Start
+## Installation
+
+### Homebrew (recommended)
+
+```bash
+brew tap MIN202299/brewmate
+brew install --cask brewmate
+```
+
+> **Note:** BrewMate is not notarized. On first launch macOS Gatekeeper may block it.
+> Run the following command once to allow it:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/BrewMate.app
+> ```
+> Or right-click the app icon and choose **Open**.
 
 ### Build from Source
 
@@ -88,7 +102,7 @@ Sources/BrewMate/
 
 ## Known Limitations
 
-- Some cask install/uninstall operations require `sudo`. Currently handled via `NSAlert` + `NSSecureTextField` password dialog; task terminates after 3 failed attempts
+- Some cask install/uninstall operations require `sudo`. Handled via **Keychain + Touch ID** — password is stored in the system Keychain on first entry and retrieved via Touch ID thereafter; task terminates after 3 failed attempts
 - The app uses ad-hoc code signing (for local use). First launch may trigger Gatekeeper — right-click → Open to bypass
 - All data comes directly from `brew` itself (read-only JSON); the app maintains no local persistent state
 
