@@ -1,0 +1,6 @@
+# Build artifacts
+.build/
+BrewMate.app/
+
+# macOS
+.DS_Store
