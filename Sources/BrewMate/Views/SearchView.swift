@@ -35,17 +35,27 @@ struct SearchView: View {
             .background(.bar)
 
             if model.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                ContentUnavailableView(
-                    "搜索 Homebrew",
-                    systemImage: "magnifyingglass",
-                    description: Text("输入关键字以查找 formulae 或 casks")
-                )
+                VStack(spacing: 0) {
+                    Spacer()
+                    ContentUnavailableView(
+                        "搜索 Homebrew",
+                        systemImage: "magnifyingglass",
+                        description: Text("输入关键字以查找 formulae 或 casks")
+                    )
+                    Spacer()
+                }
+                .frame(maxHeight: .infinity)
             } else if model.searchResults.isEmpty && !model.isSearching {
-                ContentUnavailableView(
-                    "无结果",
-                    systemImage: "questionmark.circle",
-                    description: Text("\"\(model.searchQuery)\" 没有匹配")
-                )
+                VStack(spacing: 0) {
+                    Spacer()
+                    ContentUnavailableView(
+                        "无结果",
+                        systemImage: "questionmark.circle",
+                        description: Text("\"\(model.searchQuery)\" 没有匹配")
+                    )
+                    Spacer()
+                }
+                .frame(maxHeight: .infinity)
             } else {
                 let installedNames = Set(model.installed.map { $0.id })
                 List(model.searchResults) { r in
