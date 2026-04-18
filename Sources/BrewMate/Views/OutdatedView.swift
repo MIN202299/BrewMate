@@ -5,42 +5,44 @@ struct OutdatedView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("\(model.outdated.count) 个过期包")
-                    .font(.headline)
-                Spacer()
-                if model.hasBatchUpgradeRunning {
-                    Button { } label: {
-                        HStack(spacing: 4) {
-                            ProgressView().controlSize(.mini)
-                            Text("升级中…")
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(true)
-                } else {
-                    Button {
-                        model.upgrade(nil)
-                    } label: {
-                        Label("全部升级", systemImage: "arrow.up.circle.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.outdated.isEmpty)
-                }
-            }
-            .padding(10)
-            .background(.bar)
-
             if model.isLoadingOutdated && model.outdated.isEmpty {
                 ProgressView("检查过期包...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.outdated.isEmpty {
+                // 无过期包时：空状态完整居中（和搜索页一致）
                 ContentUnavailableView(
                     "全部已是最新",
                     systemImage: "checkmark.circle",
                     description: Text("没有需要升级的包")
                 )
+                .frame(maxHeight: .infinity)
             } else {
+                // 有过期包时：显示标题栏 + 列表
+                HStack {
+                    Text("\(model.outdated.count) 个过期包")
+                        .font(.headline)
+                    Spacer()
+                    if model.hasBatchUpgradeRunning {
+                        Button { } label: {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.mini)
+                                Text("升级中…")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(true)
+                    } else {
+                        Button {
+                            model.upgrade(nil)
+                        } label: {
+                            Label("全部升级", systemImage: "arrow.up.circle.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(10)
+                .background(.bar)
+
                 List(model.outdated) { item in
                     OutdatedRow(item: item)
                 }

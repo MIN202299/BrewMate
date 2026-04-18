@@ -31,6 +31,8 @@ final class AppModel {
 
     // 密码重试跟踪（按 job id，记录错误尝试次数）
     private var pwdAttempts: [UUID: Int] = [:]
+    // PTY 输出中检测到 "try again" 的 job 集合
+    private var sudoRetryFlags: Set<UUID> = []
 
     private let service = BrewService.shared
     private var searchTask: Task<Void, Never>? = nil
@@ -97,19 +99,29 @@ final class AppModel {
 
     // MARK: - Password prompt dialog
 
-    private func requestPassword(for jobID: UUID, promptText: String) -> String? {
-        // 检测到 "Sorry, try again." → 清掉缓存的尝试
-        let isRetry = promptText.lowercased().contains("try again")
+    private func requestPassword(for jobID: UUID, isRetry: Bool) async -> String? {
         if isRetry {
-            pwdAttempts[jobID] = (pwdAttempts[jobID] ?? 0) + 1
-        } else if pwdAttempts[jobID] == nil {
-            pwdAttempts[jobID] = 0
+            CredentialStore.shared.delete()
+            pwdAttempts[jobID, default: 0] += 1
+        } else {
+            if pwdAttempts[jobID] == nil { pwdAttempts[jobID] = 0 }
         }
-        // 最多允许 3 次输入（含首次）
-        guard (pwdAttempts[jobID] ?? 0) <= 2 else {
-            return nil
+        guard (pwdAttempts[jobID] ?? 0) <= 2 else { return nil }
+
+        // 优先走 Keychain + Touch ID（仅首次，重试时说明缓存密码有误）
+        if !isRetry, CredentialStore.shared.hasStoredPassword {
+            if let pwd = await CredentialStore.shared.load(
+                reason: "BrewMate 需要验证身份以执行 Homebrew 操作"
+            ) {
+                return pwd
+            }
+            // 用户取消 Touch ID → 降级到密码框
         }
 
+        return showPasswordDialog(isRetry: isRetry)
+    }
+
+    private func showPasswordDialog(isRetry: Bool) -> String? {
         let alert = NSAlert()
         alert.messageText = "需要管理员密码"
         alert.informativeText = isRetry
@@ -118,21 +130,37 @@ final class AppModel {
         alert.addButton(withTitle: "确定")
         alert.addButton(withTitle: "取消")
 
-        let secure = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 22))
+        let hasTouch = CredentialStore.shared.isBiometricsAvailable
+        let containerH: CGFloat = hasTouch ? 52 : 24
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: containerH))
+
+        let secure = NSSecureTextField(frame: NSRect(x: 0, y: containerH - 24, width: 260, height: 22))
         secure.isBezeled = true
         secure.focusRingType = .default
-
-        // 把输入框放到 alert 的 accessory view 里
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 22))
         container.addSubview(secure)
-        alert.accessoryView = container
 
-        // 让对话框弹出时自动聚焦
-        secure.becomeFirstResponder()
+        var rememberBox: NSButton?
+        if hasTouch {
+            let cb = NSButton(checkboxWithTitle: "使用 Touch ID 记住密码", target: nil, action: nil)
+            cb.frame = NSRect(x: 2, y: 2, width: 260, height: 18)
+            cb.state = .on
+            container.addSubview(cb)
+            rememberBox = cb
+        }
+
+        alert.accessoryView = container
+        // layout() 后 window 已存在，设置 initialFirstResponder 才有效
+        alert.layout()
+        alert.window.initialFirstResponder = secure
 
         let resp = alert.runModal()
-        guard resp == .alertFirstButtonReturn else { return nil }
-        return secure.stringValue
+        guard resp == .alertFirstButtonReturn, !secure.stringValue.isEmpty else { return nil }
+
+        let password = secure.stringValue
+        if rememberBox?.state == .on {
+            try? CredentialStore.shared.save(password)
+        }
+        return password
     }
 
     // MARK: - Jobs
@@ -174,8 +202,12 @@ final class AppModel {
                         self.appendLine(jobID: id, "[pid \(pid)] brew \(args.joined(separator: " "))")
                     case .line(let line):
                         self.appendLine(jobID: id, line)
-                    case .passwordPrompt(let promptText):
-                        let password = self.requestPassword(for: id, promptText: promptText)
+                        if line.lowercased().contains("try again") {
+                            self.sudoRetryFlags.insert(id)
+                        }
+                    case .passwordPrompt:
+                        let isRetry = self.sudoRetryFlags.remove(id) != nil
+                        let password = await self.requestPassword(for: id, isRetry: isRetry)
                         if let password, !password.isEmpty {
                             writePTYPassword(password, toFD: ctrl.masterFD)
                             self.appendLine(jobID: id, "→ [密码已提交]")
@@ -198,11 +230,9 @@ final class AppModel {
                 self?.appendLine(jobID: id, "❌ \(error.localizedDescription)")
                 self?.finishJob(id: id, exitCode: -1)
             }
-            // 清理重试计数
-            await MainActor.run {
-                self?.pwdAttempts.removeValue(forKey: id)
-                ctrl.closeMaster()
-            }
+            self?.pwdAttempts.removeValue(forKey: id)
+            self?.sudoRetryFlags.remove(id)
+            ctrl.closeMaster()
         }
     }
 

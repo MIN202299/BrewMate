@@ -42,8 +42,10 @@ struct InstalledView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.installed.isEmpty {
                 ContentUnavailableView("没有已安装的包", systemImage: "shippingbox", description: Text("点击顶部刷新按钮再试"))
+                    .frame(maxHeight: .infinity)
             } else if filtered.isEmpty {
                 ContentUnavailableView("没有匹配", systemImage: "magnifyingglass", description: Text("调整过滤条件或类型筛选"))
+                    .frame(maxHeight: .infinity)
             } else {
                 List(filtered) { p in
                     InstalledRow(pkg: p)

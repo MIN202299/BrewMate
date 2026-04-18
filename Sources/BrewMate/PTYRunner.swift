@@ -19,6 +19,7 @@ enum PTYSpawnError: Error, LocalizedError {
 final class PTYController: @unchecked Sendable {
     let masterFD: Int32
     let pid: pid_t
+    private let closeLock = NSLock()
     private var closed = false
 
     init(masterFD: Int32, pid: pid_t) {
@@ -31,7 +32,11 @@ final class PTYController: @unchecked Sendable {
     }
 
     func closeMaster() {
-        if !closed { close(masterFD); closed = true }
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        guard !closed else { return }
+        close(masterFD)
+        closed = true
     }
 
     func waitForExit() -> Int32 {
