@@ -199,89 +199,104 @@ actor BrewService {
         return results
     }
 
-    // MARK: 写命令：PTY 流式（支持 sudo 密码交互）
+    // MARK: 写命令：osascript 流式（原生系统授权对话框）
+    //
+    // do shell script ... with administrator privileges 以 root 身份运行；
+    // Homebrew 拒绝以 root 执行，因此内部再用 sudo -u <originalUser> 降回原用户。
+    // root sudo 到普通用户无需额外密码，授权完全由 macOS 原生弹窗处理。
 
-    nonisolated func runStreamingPTY(args: [String]) throws -> (stream: AsyncThrowingStream<StreamEvent, Error>, controller: PTYController) {
-        let brewURL = self.brewURL
-        guard FileManager.default.isExecutableFile(atPath: brewURL.path) else {
+    private static let ansiRegex = try! NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*[A-Za-z]")
+
+    nonisolated func runStreamingAdmin(args: [String], proxyEnv: [String] = []) throws -> AsyncThrowingStream<StreamEvent, Error> {
+        let brewPath = self.brewURL.path
+        guard FileManager.default.isExecutableFile(atPath: brewPath) else {
             throw BrewError.brewNotFound
         }
 
-        var env = ProcessInfo.processInfo.environment
-        env["HOMEBREW_NO_ENV_HINTS"] = "1"
-        env["HOMEBREW_COLOR"] = "never"
-        env["HOMEBREW_NO_EMOJI"] = "1"
-        env["NO_COLOR"] = "1"
-        env["TERM"] = "dumb"
+        let logPath = NSTemporaryDirectory() + "brewmate_\(UUID().uuidString).log"
+        FileManager.default.createFile(atPath: logPath, contents: nil)
 
-        let ctrl = try spawnPTY(executable: brewURL.path, args: args, env: env)
+        let username = ProcessInfo.processInfo.userName
 
-        let stream = AsyncThrowingStream<StreamEvent, Error> { continuation in
-            continuation.yield(.started(pid: ctrl.pid))
+        // Shell single-quote escape
+        func sq(_ s: String) -> String {
+            "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
 
-            continuation.onTermination = { @Sendable _ in
-                ctrl.terminate()
+        let shellCmd = (["sudo -u", sq(username), "-H", "env",
+                         "HOMEBREW_NO_ENV_HINTS=1", "HOMEBREW_COLOR=never",
+                         "HOMEBREW_NO_EMOJI=1", "NO_COLOR=1"]
+                        + proxyEnv
+                        + [sq(brewPath)] + args.map(sq) + [">", sq(logPath), "2>&1"])
+            .joined(separator: " ")
+
+        let asEscaped = shellCmd
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let appleScript = "do shell script \"\(asEscaped)\" with administrator privileges"
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", appleScript]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { @Sendable [proc] _ in
+                if proc.isRunning { proc.terminate() }
+            }
+
+            do {
+                try proc.run()
+            } catch {
+                try? FileManager.default.removeItem(atPath: logPath)
+                continuation.finish(throwing: error)
+                return
             }
 
             Thread.detachNewThread {
-                let master = ctrl.masterFD
-                var buffer = [UInt8](repeating: 0, count: 4096)
-                var lineBuffer = ""  // 未终结的部分行（可能是 "Password:" 提示）
-                var lastPromptEmitAt: Date = .distantPast
+                let fd = open(logPath, O_RDONLY)
+                guard fd >= 0 else {
+                    proc.terminate()
+                    continuation.finish(throwing: BrewError.exit(-1, "log open failed"))
+                    return
+                }
 
-                while true {
-                    let n = read(master, &buffer, buffer.count)
-                    if n <= 0 { break }
-                    guard let chunk = String(bytes: buffer[0..<n], encoding: .utf8) else { continue }
-                    lineBuffer += chunk
+                var lineBuffer = ""
+                var offset: off_t = 0
 
-                    // 切出完整行
-                    while let nl = lineBuffer.firstIndex(of: "\n") {
-                        var line = String(lineBuffer[..<nl])
-                        lineBuffer.removeSubrange(...nl)
-                        // 清掉 PTY 的 \r
-                        if line.hasSuffix("\r") { line.removeLast() }
-                        if !line.isEmpty {
-                            continuation.yield(.line(line))
-                        }
-                    }
-
-                    // 剩余未终结行：检测是否是密码提示
-                    if Self.looksLikePasswordPrompt(lineBuffer) {
-                        // 至少相隔 200ms，避免同一提示重复触发
-                        if Date().timeIntervalSince(lastPromptEmitAt) > 0.2 {
-                            lastPromptEmitAt = Date()
-                            continuation.yield(.passwordPrompt(text: lineBuffer))
+                func drain() {
+                    var buf = [UInt8](repeating: 0, count: 65536)
+                    while true {
+                        let n = pread(fd, &buf, buf.count, offset)
+                        guard n > 0 else { break }
+                        offset += off_t(n)
+                        guard let s = String(bytes: buf[0..<n], encoding: .utf8) else { continue }
+                        let range = NSRange(s.startIndex..., in: s)
+                        let clean = BrewService.ansiRegex.stringByReplacingMatches(in: s, range: range, withTemplate: "")
+                        lineBuffer += clean
+                        while let nl = lineBuffer.firstIndex(of: "\n") {
+                            var line = String(lineBuffer[..<nl])
+                            lineBuffer.removeSubrange(...nl)
+                            if line.hasSuffix("\r") { line.removeLast() }
+                            if !line.isEmpty { continuation.yield(.line(line)) }
                         }
                     }
                 }
 
-                // flush 残余
-                if !lineBuffer.isEmpty {
-                    continuation.yield(.line(lineBuffer))
+                while proc.isRunning {
+                    drain()
+                    Thread.sleep(forTimeInterval: 0.05)
                 }
+                drain()
+                if !lineBuffer.isEmpty { continuation.yield(.line(lineBuffer)) }
 
-                let code = ctrl.waitForExit()
-                ctrl.closeMaster()
-                continuation.yield(.done(code))
+                close(fd)
+                try? FileManager.default.removeItem(atPath: logPath)
+                continuation.yield(.done(proc.terminationStatus))
                 continuation.finish()
             }
         }
-
-        return (stream, ctrl)
-    }
-
-    /// 判断缓冲区末尾是否像 sudo 密码提示
-    static func looksLikePasswordPrompt(_ buffer: String) -> Bool {
-        // 取末尾最多 120 字节做匹配
-        let tail = String(buffer.suffix(120)).lowercased()
-        // 典型 sudo 提示："Password:" 或 "password:" 行末
-        // macOS 本地化后可能是 "密码:" 或 "口令:"
-        if tail.hasSuffix("password:") || tail.hasSuffix("password: ") { return true }
-        if tail.contains("[sudo] password") && (tail.hasSuffix(":") || tail.hasSuffix(": ")) { return true }
-        if tail.hasSuffix("密码：") || tail.hasSuffix("密码:") { return true }
-        if tail.hasSuffix("口令：") || tail.hasSuffix("口令:") { return true }
-        return false
     }
 
     // MARK: 私有：一次性抓取命令全部输出
@@ -329,8 +344,6 @@ actor BrewService {
 }
 
 enum StreamEvent: Sendable {
-    case started(pid: pid_t)
     case line(String)
-    case passwordPrompt(text: String)
     case done(Int32)
 }

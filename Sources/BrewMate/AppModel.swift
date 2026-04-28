@@ -1,5 +1,4 @@
 import Foundation
-import AppKit
 import Observation
 
 @Observable
@@ -28,11 +27,6 @@ final class AppModel {
     // Job 日志
     var jobs: [JobLog] = []
     var showLogPanel: Bool = false
-
-    // 密码重试跟踪（按 job id，记录错误尝试次数）
-    private var pwdAttempts: [UUID: Int] = [:]
-    // PTY 输出中检测到 "try again" 的 job 集合
-    private var sudoRetryFlags: Set<UUID> = []
 
     private let service = BrewService.shared
     private var searchTask: Task<Void, Never>? = nil
@@ -97,142 +91,58 @@ final class AppModel {
         }
     }
 
-    // MARK: - Password prompt dialog
-
-    private func requestPassword(for jobID: UUID, isRetry: Bool) async -> String? {
-        if isRetry {
-            CredentialStore.shared.delete()
-            pwdAttempts[jobID, default: 0] += 1
-        } else {
-            if pwdAttempts[jobID] == nil { pwdAttempts[jobID] = 0 }
-        }
-        guard (pwdAttempts[jobID] ?? 0) <= 2 else { return nil }
-
-        // 优先走 Keychain + Touch ID（仅首次，重试时说明缓存密码有误）
-        if !isRetry, CredentialStore.shared.hasStoredPassword {
-            if let pwd = await CredentialStore.shared.load(
-                reason: "BrewMate 需要验证身份以执行 Homebrew 操作"
-            ) {
-                return pwd
-            }
-            // 用户取消 Touch ID → 降级到密码框
-        }
-
-        return showPasswordDialog(isRetry: isRetry)
-    }
-
-    private func showPasswordDialog(isRetry: Bool) -> String? {
-        let alert = NSAlert()
-        alert.messageText = "需要管理员密码"
-        alert.informativeText = isRetry
-            ? "密码错误，请重试"
-            : "此操作需要 sudo 权限，请输入密码"
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
-
-        let hasTouch = CredentialStore.shared.isBiometricsAvailable
-        let containerH: CGFloat = hasTouch ? 52 : 24
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: containerH))
-
-        let secure = NSSecureTextField(frame: NSRect(x: 0, y: containerH - 24, width: 260, height: 22))
-        secure.isBezeled = true
-        secure.focusRingType = .default
-        container.addSubview(secure)
-
-        var rememberBox: NSButton?
-        if hasTouch {
-            let cb = NSButton(checkboxWithTitle: "使用 Touch ID 记住密码", target: nil, action: nil)
-            cb.frame = NSRect(x: 2, y: 2, width: 260, height: 18)
-            cb.state = .on
-            container.addSubview(cb)
-            rememberBox = cb
-        }
-
-        alert.accessoryView = container
-        // layout() 后 window 已存在，设置 initialFirstResponder 才有效
-        alert.layout()
-        alert.window.initialFirstResponder = secure
-
-        let resp = alert.runModal()
-        guard resp == .alertFirstButtonReturn, !secure.stringValue.isEmpty else { return nil }
-
-        let password = secure.stringValue
-        if rememberBox?.state == .on {
-            try? CredentialStore.shared.save(password)
-        }
-        return password
-    }
-
     // MARK: - Jobs
 
     func startJob(title: String, args: [String], onComplete: (@Sendable () async -> Void)? = nil) {
-        // 幂等：已有同名任务在运行/已成功 → 直接展开日志不重复触发；失败的允许重试
-        if let existing = jobs.last(where: { $0.title == title }) {
-            switch existing.status {
-            case .running, .succeeded:
-                showLogPanel = true
-                return
-            case .failed:
-                break
-            }
+        // 运行中的同名任务不重复触发，避免并发冲突；已完成/失败的均允许重试
+        if let existing = jobs.last(where: { $0.title == title }),
+           existing.status == .running {
+            showLogPanel = true
+            return
         }
 
         let log = JobLog(title: title)
         jobs.append(log)
         showLogPanel = true
         let id = log.id
+        appendLine(jobID: id, "brew \(args.joined(separator: " "))")
+        let proxy = ProxySettings.shared
+        if proxy.enabled {
+            let http = proxy.httpProxy.isEmpty ? "(未设置)" : proxy.httpProxy
+            let socks = proxy.allProxy.isEmpty ? "" : "  all_proxy: \(proxy.allProxy)"
+            appendLine(jobID: id, "→ 代理: \(http)\(socks)")
+        }
 
-        // 启动 PTY 流
-        let result: (stream: AsyncThrowingStream<StreamEvent, Error>, controller: PTYController)
+        let stream: AsyncThrowingStream<StreamEvent, Error>
         do {
-            result = try service.runStreamingPTY(args: args)
+            stream = try service.runStreamingAdmin(args: args, proxyEnv: proxy.shellEnvArgs)
         } catch {
             appendLine(jobID: id, "❌ 启动失败: \(error.localizedDescription)")
             finishJob(id: id, exitCode: -1)
             return
         }
-        let (stream, ctrl) = result
 
         Task { [weak self] in
             do {
                 for try await event in stream {
-                    guard let self else { ctrl.closeMaster(); return }
+                    guard let self else { return }
                     switch event {
-                    case .started(let pid):
-                        self.appendLine(jobID: id, "[pid \(pid)] brew \(args.joined(separator: " "))")
                     case .line(let line):
                         self.appendLine(jobID: id, line)
-                        if line.lowercased().contains("try again") {
-                            self.sudoRetryFlags.insert(id)
-                        }
-                    case .passwordPrompt:
-                        let isRetry = self.sudoRetryFlags.remove(id) != nil
-                        let password = await self.requestPassword(for: id, isRetry: isRetry)
-                        if let password, !password.isEmpty {
-                            writePTYPassword(password, toFD: ctrl.masterFD)
-                            self.appendLine(jobID: id, "→ [密码已提交]")
-                        } else {
-                            // 用户取消或超过重试次数
-                            ctrl.terminate()
-                            self.appendLine(jobID: id, "→ [密码已取消]")
-                        }
                     case .done(let code):
+                        if code != 0 {
+                            self.appendLine(jobID: id, "→ [失败，退出码 \(code)]")
+                        }
                         self.finishJob(id: id, exitCode: code)
                     }
                 }
-                // Stream 正常完成
                 self?.finishJob(id: id, exitCode: 0)
-                await onComplete?()
-            } catch let BrewError.exit(code, _) {
-                self?.finishJob(id: id, exitCode: code)
-                await onComplete?()
             } catch {
                 self?.appendLine(jobID: id, "❌ \(error.localizedDescription)")
                 self?.finishJob(id: id, exitCode: -1)
             }
-            self?.pwdAttempts.removeValue(forKey: id)
-            self?.sudoRetryFlags.remove(id)
-            ctrl.closeMaster()
+            // 无论成功还是失败都刷新列表，确保 UI 与实际状态一致
+            await onComplete?()
         }
     }
 

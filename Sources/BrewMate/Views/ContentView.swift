@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @State private var showSettings = false
 
     var body: some View {
         @Bindable var bindable = model
@@ -81,6 +82,14 @@ struct ContentView: View {
                 }
                 .disabled(model.jobs.isEmpty)
             }
+            ToolbarItem(placement: .primaryAction) {
+                Button { showSettings = true } label: {
+                    Label("设置", systemImage: "gearshape")
+                }
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
         }
         .alert("出错了", isPresented: Binding(
             get: { model.lastError != nil },

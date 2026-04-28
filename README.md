@@ -16,23 +16,23 @@ Zero third-party dependencies — built entirely with Apple frameworks (SwiftUI,
 | **Outdated** | See upgradable packages at a glance; upgrade individually or all at once |
 | **Search** | Real-time search across the Homebrew repository with formula/cask/all filters |
 | **Live Logs** | Stream output from `install` / `uninstall` / `upgrade` commands in real-time |
-| **Password Prompts** | Native dialog for `sudo`-required operations (e.g. certain cask uninstalls) |
+| **Native Auth** | Uses macOS system authorization dialog (with Touch ID support) for privileged operations |
+| **Proxy Support** | Configure HTTP/HTTPS and SOCKS5 proxy for Homebrew downloads, with one-click connectivity test |
 | **Auto-Refresh** | Package lists refresh automatically after every operation |
-| **Deduplication** | Prevents duplicate task triggers; failed tasks can be retried |
 
 ## Screenshots
 
 | Installed | Outdated |
 |---|---|
-| List installed packages with name, type, version, and description; outdated items highlighted in red | Shows upgradable packages with version comparison; supports individual and batch upgrade |
+| List installed packages with name, type, version, and description; outdated items highlighted in green | Shows upgradable packages with version comparison; supports individual and batch upgrade |
 | Search | Logs |
-| Real-time keyword search with formula/cask filtering and one-click install | Real-time streaming output for all commands, multi-task support, password auto-prompt |
+| Real-time keyword search with formula/cask filtering and one-click install | Real-time streaming output for all commands, multi-task support |
 
 ## Requirements
 
 - **macOS 14 or later**
 - **Homebrew** installed (at `/opt/homebrew/bin/brew` or `/usr/local/bin/brew`)
-- **Swift 5.9+** (from Xcode or Command Line Tools)
+- **Swift 5.9+** (from Xcode or Command Line Tools, for building from source)
 
 ## Installation
 
@@ -67,27 +67,21 @@ After building, drag `BrewMate.app` into `/Applications` or run directly.
 swift run
 ```
 
-### Regenerate Icon (optional)
-
-```bash
-swift tools/make_icon.swift
-iconutil -c icns assets/BrewMate.iconset -o assets/BrewMate.icns
-```
-
 ## Architecture
 
 ```
 Sources/BrewMate/
 ├── BrewMateApp.swift          # @main App, window & menu bar
 ├── AppModel.swift             # @Observable root state + Job lifecycle
-├── BrewService.swift          # actor: brew subprocess (PTY streaming + JSON parsing)
-├── PTYRunner.swift            # openpty + posix_spawn for sudo password interaction
+├── BrewService.swift          # actor: brew subprocess (osascript streaming + JSON parsing)
+├── ProxySettings.swift        # @Observable proxy config, UserDefaults-backed
 ├── Models.swift               # Package / OutdatedItem / SearchResult / JobLog
 ├── Views/
 │   ├── ContentView.swift       # NavigationSplitView scaffold + toolbar
 │   ├── InstalledView.swift     # Installed packages list
 │   ├── OutdatedView.swift      # Outdated packages list
 │   ├── SearchView.swift        # Search + install
+│   ├── SettingsView.swift      # Proxy settings sheet
 │   └── JobLogView.swift        # Bottom log panel (multi-task tabs + auto-scroll)
 └── Resources/
     └── Info.plist              # Bundle metadata
@@ -95,14 +89,15 @@ Sources/BrewMate/
 
 ### Technical Highlights
 
-- **PTY Subprocess**: Uses `openpty` + `posix_spawn` to allocate a pseudo-terminal for brew, enabling `sudo` to read passwords; output is split by line and streamed in real-time
-- **Concurrent Search**: Uses `async let` to run formula and cask searches in parallel (`brew search` produces no section headers in non-TTY mode), then merges results
-- **Idempotent Operations**: Running or succeeded tasks prevent duplicate triggers; failed tasks allow retry
+- **Native Authorization**: Uses `osascript` with `do shell script ... with administrator privileges` to trigger the macOS system auth dialog (supports Touch ID). Brew is then run as the original user via `sudo -u <user>` to satisfy Homebrew's no-root requirement
+- **Streaming Output**: Brew output is written to a temp file; a background thread polls it with `pread` at 50 ms intervals for real-time log display. ANSI escape codes are stripped automatically
+- **Concurrent Search**: Uses `async let` to run formula and cask searches in parallel, then merges results
+- **Proxy Support**: Injects `http_proxy`, `https_proxy`, and `all_proxy` env vars into the brew subprocess; settings persist via `UserDefaults`
 - **No Sandbox**: App is unsandboxed to enable subprocess spawning for `brew`
 
 ## Known Limitations
 
-- Some cask install/uninstall operations require `sudo`. Handled via **Keychain + Touch ID** — password is stored in the system Keychain on first entry and retrieved via Touch ID thereafter; task terminates after 3 failed attempts
+- Privileged operations (certain cask installs/uninstalls) show the native macOS system authorization dialog. The OS handles credential caching; no passwords are stored by the app
 - The app uses ad-hoc code signing (for local use). First launch may trigger Gatekeeper — right-click → Open to bypass
 - All data comes directly from `brew` itself (read-only JSON); the app maintains no local persistent state
 
