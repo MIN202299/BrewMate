@@ -191,10 +191,26 @@ final class AppModel {
         }
     }
 
-    func upgrade(_ name: String? = nil) {
+    func upgrade(_ name: String? = nil, cask: Bool? = nil) {
         var args = ["upgrade"]
-        if let n = name { args.append(n) }
-        startJob(title: name.map { "upgrade \($0)" } ?? "upgrade (all)", args: args) { [weak self] in
+        if let n = name {
+            // 单包升级：明确 --cask/--formula 避免歧义
+            if let c = cask { args.append(c ? "--cask" : "--formula") }
+            args.append(n)
+        } else {
+            // 全量升级：必须加 --greedy 才会处理 auto_updates/version:latest 类型的 cask
+            args.append("--greedy")
+        }
+        let jobTitle = name.map { "upgrade \($0)" } ?? "upgrade (all)"
+        startJob(title: jobTitle, args: args) { [weak self] in
+            // 升级成功后立即从待升级列表中移除，无需等待 refreshOutdated 完成
+            if let n = name {
+                await MainActor.run { [weak self] in
+                    if self?.jobs.last(where: { $0.title == "upgrade \(n)" })?.status == .succeeded {
+                        self?.outdated.removeAll { $0.name == n }
+                    }
+                }
+            }
             await self?.refreshInstalled()
             await self?.refreshOutdated()
         }

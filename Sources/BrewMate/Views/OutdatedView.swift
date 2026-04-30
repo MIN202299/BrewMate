@@ -93,7 +93,7 @@ private struct OutdatedRow: View {
                 .controlSize(.small)
                 .disabled(true)
             } else {
-                Button("升级") { model.upgrade(item.name) }
+                Button("升级") { model.upgrade(item.name, cask: item.kind == .cask) }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(item.isPinned)
